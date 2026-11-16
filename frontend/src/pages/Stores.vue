@@ -1,16 +1,23 @@
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { getJson, postJson, putJson, deleteJson } from '../api'
 
 const stores = ref([])
 const rejections = ref([])
 const domains = ref([])
 const domainId = ref(null)
+const jobs = ref([])
 const err = ref('')
 const busy = ref(false)
 
 const form = reactive({ store_code: '', store_name: '', enabled: true })
 const editing = ref(null)
+
+const latestProofJob = computed(
+  () => jobs.value.find((j) => j.step === 'paste_to_detail' && j.dim_alignment_proof) || null,
+)
+const proof = computed(() => (latestProofJob.value ? latestProofJob.value.dim_alignment_proof : null))
+const rejectReasons = computed(() => (latestProofJob.value ? latestProofJob.value.reject_reasons : []))
 
 async function refreshStores() {
   stores.value = await getJson('/api/stores')
@@ -21,8 +28,16 @@ async function refreshRejections() {
   rejections.value = await getJson(`/api/rejections${qs}`)
 }
 
+async function refreshJobs() {
+  if (!domainId.value) {
+    jobs.value = []
+    return
+  }
+  jobs.value = await getJson(`/api/jobs?domain_id=${domainId.value}`)
+}
+
 async function refreshAll() {
-  await Promise.all([refreshStores(), refreshRejections()])
+  await Promise.all([refreshStores(), refreshRejections(), refreshJobs()])
 }
 
 onMounted(async () => {
@@ -157,15 +172,68 @@ async function removeStore(s) {
     </div>
 
     <div class="panel">
+      <h3>维对齐证明</h3>
+      <template v-if="proof">
+        <p class="muted">
+          来源任务 {{ latestProofJob.id }}（{{ latestProofJob.created_at }}）。
+          以下字段由启用维集合、拒收清单、明细层同源派生后随任务固化，不另起独立计数器。
+        </p>
+        <div class="proof-grid">
+          <div class="proof-item"><span class="label">启用维数</span><span class="value">{{ proof.enabled_dim_count }}</span></div>
+          <div class="proof-item"><span class="label">命中维</span><span class="value">{{ proof.hit_count }}</span></div>
+          <div class="proof-item"><span class="label">拒收</span><span class="value warn">{{ proof.reject_count }}</span></div>
+          <div class="proof-item"><span class="label">空名回填</span><span class="value">{{ proof.backfill_count }}</span></div>
+          <div class="proof-item"><span class="label">冲突回填</span><span class="value warn">{{ proof.conflict_count }}</span></div>
+        </div>
+
+        <h3>拒收原因（来源任务）</h3>
+        <table v-if="rejectReasons.length">
+          <thead><tr><th>拒收原因</th><th>行数</th></tr></thead>
+          <tbody>
+            <tr v-for="r in rejectReasons" :key="r.reason">
+              <td class="warn">{{ r.reason }}</td>
+              <td>{{ r.count }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="muted">来源任务没有拒收行。</p>
+
+        <h3>样本键</h3>
+        <table>
+          <thead><tr><th>类型</th><th>业务日</th><th>门店编码</th><th>门店名称 / 贴源名称</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr v-for="(s, i) in proof.sample_keys.命中" :key="`hit-${i}`">
+              <td>{{ s.类型 }}</td><td>{{ s.业务日 }}</td><td>{{ s.门店编码 }}</td>
+              <td>{{ s.门店名称 }}</td><td>{{ s.名称来源 }}</td>
+            </tr>
+            <tr v-for="(s, i) in proof.sample_keys.空名回填" :key="`back-${i}`">
+              <td>{{ s.类型 }}</td><td>{{ s.业务日 }}</td><td>{{ s.门店编码 }}</td>
+              <td>{{ s.门店名称 }}</td><td>{{ s.名称来源 }}</td>
+            </tr>
+            <tr v-for="(s, i) in proof.sample_keys.冲突回填" :key="`conf-${i}`">
+              <td class="warn">{{ s.类型 }}</td><td>{{ s.业务日 }}</td><td>{{ s.门店编码 }}</td>
+              <td>{{ s.门店名称 }}</td><td>{{ s.名称来源 }}</td>
+            </tr>
+            <tr v-for="(s, i) in proof.sample_keys.拒收" :key="`rej-${i}`">
+              <td class="warn">{{ s.类型 }}</td><td>{{ s.业务日 }}</td><td>{{ s.门店编码 }}</td>
+              <td>{{ s.贴源门店名称 || '（空）' }}</td><td class="warn">{{ s.拒收原因 }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </template>
+      <p v-else class="muted">该主题域还没有贴源到明细任务，暂无可展示的维对齐证明。</p>
+    </div>
+
+    <div class="panel">
       <h3>维缺失拒收清单</h3>
       <div class="toolbar">
         <label>
           主题域
-          <select v-model.number="domainId" @change="refreshRejections">
+          <select v-model.number="domainId" @change="refreshAll">
             <option v-for="d in domains" :key="d.id" :value="d.id">{{ d.name }}</option>
           </select>
         </label>
-        <button class="secondary" @click="refreshRejections">刷新</button>
+        <button class="secondary" @click="refreshAll">刷新</button>
       </div>
       <table>
         <thead>
@@ -215,5 +283,34 @@ label.check {
 .ops button {
   margin-right: 6px;
   padding: 5px 10px;
+}
+.proof-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  margin: 12px 0 18px;
+  background: rgba(247, 249, 252, 0.7);
+}
+.proof-item {
+  padding: 12px 14px;
+  border-right: 1px solid var(--line);
+  display: grid;
+  gap: 4px;
+}
+.proof-item:last-child { border-right: none; }
+.proof-item .label {
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+}
+.proof-item .value {
+  font-size: 24px;
+  font-family: "Noto Serif SC", serif;
+  font-weight: 700;
+}
+.proof-item .value.warn { color: var(--warn); }
+@media (max-width: 860px) {
+  .proof-grid { grid-template-columns: 1fr 1fr; }
 }
 </style>

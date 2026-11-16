@@ -75,7 +75,7 @@ def test_legacy_db_migrates_without_touching_history(monkeypatch, tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        assert {"dim_store", "clean_rejections"} <= names
+        assert {"dim_store", "clean_rejections", "dim_alignment_proofs"} <= names
 
         # 新列存在且默认值合理
         detail_cols = {r["name"] for r in conn.execute("PRAGMA table_info(layer_detail)").fetchall()}

@@ -45,17 +45,16 @@ def layer_rows(table: str, domain_id: int | None = None) -> list[dict]:
     if table not in allowed:
         raise ValueError("未知分层")
     if table == "detail":
+        # 明细层店名是清洗入库时的快照：原样读本表，绝不临时 JOIN 维表伪装成新名称
         sql = (
-            "SELECT d.id, d.domain_id, d.job_id, d.biz_day, d.store_code, "
-            "COALESCE(s.store_name, d.store_name) AS store_name, "
-            "d.category, d.amount, d.qty, d.clean_flag, d.name_source "
-            "FROM layer_detail d LEFT JOIN dim_store s ON s.store_code = d.store_code"
+            "SELECT id, domain_id, job_id, biz_day, store_code, store_name, "
+            "category, amount, qty, clean_flag, name_source FROM layer_detail"
         )
         args: tuple = ()
         if domain_id is not None:
-            sql += " WHERE d.domain_id=?"
+            sql += " WHERE domain_id=?"
             args = (domain_id,)
-        sql += " ORDER BY d.id"
+        sql += " ORDER BY id"
     else:
         sql = f"SELECT * FROM {allowed[table]}"
         args = ()
@@ -100,6 +99,32 @@ def list_jobs(domain_id: int | None = None) -> list[dict]:
         for r in rows:
             d = dict(r)
             d["step_label"] = STEP_LABEL.get(d["step"], d["step"])
+            # 拒收原因与维对齐证明都从落库实体同源派生，不维护独立计数器
+            d["reject_reasons"] = rows_to_dicts(
+                conn.execute(
+                    """
+                    SELECT reason, COUNT(*) AS count FROM clean_rejections
+                     WHERE job_id=? GROUP BY reason ORDER BY count DESC, reason
+                    """,
+                    (d["id"],),
+                ).fetchall()
+            )
+            proof = conn.execute(
+                "SELECT * FROM dim_alignment_proofs WHERE job_id=?", (d["id"],)
+            ).fetchone()
+            if proof:
+                d["dim_alignment_proof"] = {
+                    "job_id": proof["job_id"],
+                    "enabled_dim_count": proof["enabled_dim_count"],
+                    "hit_count": proof["hit_count"],
+                    "reject_count": proof["reject_count"],
+                    "backfill_count": proof["backfill_count"],
+                    "conflict_count": proof["conflict_count"],
+                    "sample_keys": json.loads(proof["sample_keys"]),
+                    "created_at": proof["created_at"],
+                }
+            else:
+                d["dim_alignment_proof"] = None
             out.append(d)
         return out
     finally:
@@ -141,8 +166,11 @@ def run_paste_to_detail(domain_id: int) -> dict:
             amount = float(row["amount"])
 
             reasons: list[str] = []
-            if store_code in disabled_codes:
-                reasons.append(REASON_DISABLED)
+            if store_code not in enabled_dim:
+                # 未知编码与停用/删除编码一样，一律不得写入明细，也绝不做店名模糊匹配
+                reasons.append(
+                    REASON_DISABLED if store_code in disabled_codes else REASON_UNKNOWN
+                )
             if amount < 0:
                 reasons.append(REASON_NEGATIVE)
             if reasons:
@@ -168,16 +196,12 @@ def run_paste_to_detail(domain_id: int) -> dict:
                 )
                 continue
 
-            if store_code in enabled_dim:
-                dim_name = enabled_dim[store_code]
-                if not paste_name:
-                    name_source = NAME_SOURCE_BACKFILL
-                elif paste_name != dim_name:
-                    name_source = NAME_SOURCE_CONFLICT
-                else:
-                    name_source = NAME_SOURCE_AS_IS
+            dim_name = enabled_dim[store_code]
+            if not paste_name:
+                name_source = NAME_SOURCE_BACKFILL
+            elif paste_name != dim_name:
+                name_source = NAME_SOURCE_CONFLICT
             else:
-                dim_name = paste_name or store_code
                 name_source = NAME_SOURCE_AS_IS
             conn.execute(
                 """
@@ -240,6 +264,28 @@ def run_paste_to_detail(domain_id: int) -> dict:
             # 同源派生的硬校验：输入必须等于写入加拒收，防止口径漂移
             raise RuntimeError("清洗计数校验失败：输入数与写入+拒收不一致")
 
+        # 维对齐证明：与启用维集合、拒收清单、明细层同源派生后固化到本任务，
+        # 不读任何独立计数器；样本键取命中/拒收/冲突回填的代表行，便于复核
+        proof = build_dim_alignment_proof(conn, job_id, domain_id)
+        conn.execute(
+            """
+            INSERT INTO dim_alignment_proofs(
+              job_id, domain_id, enabled_dim_count, hit_count, reject_count,
+              backfill_count, conflict_count, sample_keys
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                domain_id,
+                proof["enabled_dim_count"],
+                proof["hit_count"],
+                proof["reject_count"],
+                proof["backfill_count"],
+                proof["conflict_count"],
+                json.dumps(proof["sample_keys"], ensure_ascii=False),
+            ),
+        )
+
         conn.execute(
             """
             UPDATE layer_jobs
@@ -262,6 +308,152 @@ def run_paste_to_detail(domain_id: int) -> dict:
         )
         conn.commit()
         return dict(conn.execute("SELECT * FROM layer_jobs WHERE id=?", (job_id,)).fetchone())
+    finally:
+        conn.close()
+
+
+def build_dim_alignment_proof(
+    conn, job_id: int, domain_id: int, sample_limit: int = 5
+) -> dict:
+    """由启用维集合、明细层、拒收清单为本次任务同源派生维对齐证明。
+
+    只做 SQL 聚合与样本取样，不维护任何独立累加计数器。
+    """
+    enabled_dim_count = int(
+        conn.execute("SELECT COUNT(*) AS c FROM dim_store WHERE enabled=1").fetchone()["c"]
+    )
+    hit_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM layer_detail d
+             WHERE d.domain_id=? AND d.job_id=?
+               AND EXISTS (
+                 SELECT 1 FROM dim_store s
+                  WHERE s.store_code=d.store_code AND s.enabled=1
+               )
+            """,
+            (domain_id, job_id),
+        ).fetchone()["c"]
+    )
+    reject_count = int(
+        conn.execute(
+            "SELECT COUNT(*) AS c FROM clean_rejections WHERE domain_id=? AND job_id=?",
+            (domain_id, job_id),
+        ).fetchone()["c"]
+    )
+    backfill_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM layer_detail
+             WHERE domain_id=? AND job_id=? AND name_source=?
+            """,
+            (domain_id, job_id, NAME_SOURCE_BACKFILL),
+        ).fetchone()["c"]
+    )
+    conflict_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM layer_detail
+             WHERE domain_id=? AND job_id=? AND name_source=?
+            """,
+            (domain_id, job_id, NAME_SOURCE_CONFLICT),
+        ).fetchone()["c"]
+    )
+
+    hit_samples = [
+        {
+            "类型": "命中",
+            "业务日": r["biz_day"],
+            "门店编码": r["store_code"],
+            "门店名称": r["store_name"],
+            "名称来源": r["name_source"],
+        }
+        for r in conn.execute(
+            """
+            SELECT biz_day, store_code, store_name, name_source FROM layer_detail
+             WHERE domain_id=? AND job_id=? ORDER BY id LIMIT ?
+            """,
+            (domain_id, job_id, sample_limit),
+        ).fetchall()
+    ]
+    conflict_samples = [
+        {
+            "类型": "冲突回填",
+            "业务日": r["biz_day"],
+            "门店编码": r["store_code"],
+            "门店名称": r["store_name"],
+            "名称来源": r["name_source"],
+        }
+        for r in conn.execute(
+            """
+            SELECT biz_day, store_code, store_name, name_source FROM layer_detail
+             WHERE domain_id=? AND job_id=? AND name_source=? ORDER BY id LIMIT ?
+            """,
+            (domain_id, job_id, NAME_SOURCE_CONFLICT, sample_limit),
+        ).fetchall()
+    ]
+    backfill_samples = [
+        {
+            "类型": "空名回填",
+            "业务日": r["biz_day"],
+            "门店编码": r["store_code"],
+            "门店名称": r["store_name"],
+            "名称来源": r["name_source"],
+        }
+        for r in conn.execute(
+            """
+            SELECT biz_day, store_code, store_name, name_source FROM layer_detail
+             WHERE domain_id=? AND job_id=? AND name_source=? ORDER BY id LIMIT ?
+            """,
+            (domain_id, job_id, NAME_SOURCE_BACKFILL, sample_limit),
+        ).fetchall()
+    ]
+    reject_samples = [
+        {
+            "类型": "拒收",
+            "业务日": r["biz_day"],
+            "门店编码": r["store_code"],
+            "贴源门店名称": r["store_name_paste"],
+            "拒收原因": r["reason"],
+        }
+        for r in conn.execute(
+            """
+            SELECT biz_day, store_code, store_name_paste, reason FROM clean_rejections
+             WHERE domain_id=? AND job_id=? ORDER BY id LIMIT ?
+            """,
+            (domain_id, job_id, sample_limit),
+        ).fetchall()
+    ]
+
+    return {
+        "enabled_dim_count": enabled_dim_count,
+        "hit_count": hit_count,
+        "reject_count": reject_count,
+        "backfill_count": backfill_count,
+        "conflict_count": conflict_count,
+        "sample_keys": {
+            "命中": hit_samples,
+            "空名回填": backfill_samples,
+            "冲突回填": conflict_samples,
+            "拒收": reject_samples,
+        },
+    }
+
+
+def get_dim_alignment_proof(job_id: int) -> dict | None:
+    """按任务 id 只读返回维对齐证明；证明一旦落库即不可变。"""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM dim_alignment_proofs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if not row:
+            return None
+        proof = dict(row)
+        proof["sample_keys"] = json.loads(proof["sample_keys"])
+        job = conn.execute("SELECT * FROM layer_jobs WHERE id=?", (job_id,)).fetchone()
+        proof["job"] = dict(job) if job else None
+        return proof
     finally:
         conn.close()
 

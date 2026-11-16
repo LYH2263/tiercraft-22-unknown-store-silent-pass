@@ -87,10 +87,7 @@ def update_store(
             """,
             (new_code, new_name, new_enabled, store_id),
         )
-        conn.execute(
-            "UPDATE layer_detail SET store_name=? WHERE store_code=?",
-            (new_name, row["store_code"]),
-        )
+        # 只改维表本身：历史明细是清洗入库时的快照，不得级联改写或删除
         conn.commit()
         return get_store(store_id)  # type: ignore[return-value]
     finally:

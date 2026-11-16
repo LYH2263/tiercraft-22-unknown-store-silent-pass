@@ -279,3 +279,93 @@ def test_summary_and_reconcile_still_balanced(domain_id):
     assert report["status"] == "一致"
     assert report["detail"]["明细行数"] == 7
     assert report["detail"]["键对齐"] is True
+
+
+# ---------- 维对齐证明：新增实体，任务级不可变，与三处同源派生 ----------
+
+def test_dim_alignment_proof_derived_from_sources(domain_id):
+    job = pipeline.run_paste_to_detail(domain_id)
+    proof = pipeline.get_dim_alignment_proof(job["id"])
+    assert proof is not None
+    assert proof["job_id"] == job["id"]
+
+    conn = connect()
+    try:
+        enabled_n = conn.execute(
+            "SELECT COUNT(*) AS c FROM dim_store WHERE enabled=1"
+        ).fetchone()["c"]
+        detail_n = conn.execute(
+            "SELECT COUNT(*) AS c FROM layer_detail WHERE job_id=?", (job["id"],)
+        ).fetchone()["c"]
+        reject_n = conn.execute(
+            "SELECT COUNT(*) AS c FROM clean_rejections WHERE job_id=?", (job["id"],)
+        ).fetchone()["c"]
+        backfill_n = conn.execute(
+            "SELECT COUNT(*) AS c FROM layer_detail WHERE job_id=? AND name_source=?",
+            (job["id"], NAME_SOURCE_BACKFILL),
+        ).fetchone()["c"]
+        conflict_n = conn.execute(
+            "SELECT COUNT(*) AS c FROM layer_detail WHERE job_id=? AND name_source=?",
+            (job["id"], NAME_SOURCE_CONFLICT),
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+
+    # 计数必须与维启用集合、明细层、拒收清单同源一致
+    assert proof["enabled_dim_count"] == enabled_n
+    assert proof["hit_count"] == detail_n == job["out_count"]
+    assert proof["reject_count"] == reject_n == job["drop_count"]
+    assert proof["backfill_count"] == backfill_n == job["backfill_count"]
+    assert proof["conflict_count"] == conflict_n == job["conflict_count"]
+
+    # 样本键覆盖命中、空名回填、冲突回填、拒收四类，并带可复核的门店编码
+    sample = proof["sample_keys"]
+    assert set(sample) == {"命中", "空名回填", "冲突回填", "拒收"}
+    assert all("门店编码" in s for s in sample["命中"])
+    assert [s["门店编码"] for s in sample["空名回填"]] == ["S02"]
+    assert any(s["门店编码"] == "S01" for s in sample["冲突回填"])
+    assert {s["门店编码"] for s in sample["拒收"]} >= {"S03", "S99"}
+
+
+def test_dim_alignment_proof_immutable_after_dim_changes(domain_id):
+    job = pipeline.run_paste_to_detail(domain_id)
+    before = pipeline.get_dim_alignment_proof(job["id"])
+
+    conn = connect()
+    try:
+        s01 = conn.execute("SELECT id FROM dim_store WHERE store_code='S01'").fetchone()["id"]
+    finally:
+        conn.close()
+
+    # 后续维变更 + 重跑清洗，都不得改写历史任务的证明
+    stores.update_store(s01, store_name="城东店（改名）", enabled=False)
+    job2 = pipeline.run_paste_to_detail(domain_id)
+    assert job2["id"] != job["id"]
+
+    after = pipeline.get_dim_alignment_proof(job["id"])
+    assert after == before
+
+    # 证明实体本身禁止就地改写或删除
+    conn = connect()
+    try:
+        with pytest.raises(Exception):
+            conn.execute(
+                "UPDATE dim_alignment_proofs SET hit_count=999 WHERE job_id=?", (job["id"],)
+            )
+            conn.commit()
+        conn.rollback()
+        with pytest.raises(Exception):
+            conn.execute("DELETE FROM dim_alignment_proofs WHERE job_id=?", (job["id"],))
+            conn.commit()
+        conn.rollback()
+    finally:
+        conn.close()
+
+    still = pipeline.get_dim_alignment_proof(job["id"])
+    assert still["hit_count"] == before["hit_count"]
+
+
+def test_dim_alignment_proof_absent_for_summary_job(domain_id):
+    pipeline.run_paste_to_detail(domain_id)
+    summary_job = pipeline.run_detail_to_summary(domain_id)
+    assert pipeline.get_dim_alignment_proof(summary_job["id"]) is None

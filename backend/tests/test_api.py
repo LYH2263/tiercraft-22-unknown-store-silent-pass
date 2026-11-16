@@ -57,3 +57,28 @@ def test_detail_api_returns_stored_snapshot_not_join(domain_id):
     detail = client.get("/api/layers/明细").json()
     s01 = [r for r in detail if r["store_code"] == "S01"]
     assert s01 and all(r["store_name"] == "城东店" for r in s01)
+
+
+def test_dim_alignment_proof_readonly_api(domain_id):
+    job = client.post("/api/jobs/paste-to-detail", json={"domain_id": domain_id}).json()
+    r = client.get(f"/api/jobs/{job['id']}/dim-alignment-proof")
+    assert r.status_code == 200
+    proof = r.json()
+    assert proof["job_id"] == job["id"]
+    assert proof["hit_count"] == job["out_count"]
+    assert proof["reject_count"] == job["drop_count"]
+    assert set(proof["sample_keys"]) == {"命中", "空名回填", "冲突回填", "拒收"}
+    # 只读接口：不接受写入方法
+    assert client.post(
+        f"/api/jobs/{job['id']}/dim-alignment-proof", json={}
+    ).status_code == 405
+    # 未跑清洗的任务没有证明
+    assert client.get("/api/jobs/999999/dim-alignment-proof").status_code == 404
+
+
+def test_jobs_list_carries_reject_reasons_and_proof(domain_id):
+    job = client.post("/api/jobs/paste-to-detail", json={"domain_id": domain_id}).json()
+    listed = next(j for j in client.get(f"/api/jobs?domain_id={domain_id}").json() if j["id"] == job["id"])
+    reasons = {r["reason"] for r in listed["reject_reasons"]}
+    assert any("未知门店编码" in r for r in reasons)
+    assert listed["dim_alignment_proof"]["hit_count"] == job["out_count"]

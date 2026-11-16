@@ -97,6 +97,37 @@ CREATE TABLE IF NOT EXISTS clean_rejections (
   FOREIGN KEY(domain_id) REFERENCES domains(id)
 );
 
+-- 维对齐证明：按任务留存一次的不可变实体。
+-- 计数与样本键均由明细层、拒收清单、启用维集合在任务完成时 SQL 同源派生后固化，
+-- 不设独立累加计数器，也不随后续维变更或重刷改写。
+CREATE TABLE IF NOT EXISTS dim_alignment_proofs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL UNIQUE,
+  domain_id INTEGER NOT NULL,
+  enabled_dim_count INTEGER NOT NULL,
+  hit_count INTEGER NOT NULL,
+  reject_count INTEGER NOT NULL,
+  backfill_count INTEGER NOT NULL,
+  conflict_count INTEGER NOT NULL,
+  sample_keys TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(job_id) REFERENCES layer_jobs(id),
+  FOREIGN KEY(domain_id) REFERENCES domains(id)
+);
+
+-- 证明实体一经落库即不可变：禁止更新与删除，历史任务证明不随后续维变更被改写
+CREATE TRIGGER IF NOT EXISTS trg_dim_alignment_proofs_no_update
+BEFORE UPDATE ON dim_alignment_proofs
+BEGIN
+  SELECT RAISE(ABORT, '维对齐证明不可改写');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dim_alignment_proofs_no_delete
+BEFORE DELETE ON dim_alignment_proofs
+BEGIN
+  SELECT RAISE(ABORT, '维对齐证明不可删除');
+END;
+
 CREATE TABLE IF NOT EXISTS reconcile_reports (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   domain_id INTEGER NOT NULL,

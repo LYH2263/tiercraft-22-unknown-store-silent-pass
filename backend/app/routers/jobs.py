@@ -15,6 +15,14 @@ def list_jobs(domain_id: int | None = None):
     return pipeline.list_jobs(domain_id)
 
 
+@router.get("/jobs/{job_id}/dim-alignment-proof")
+def get_dim_alignment_proof(job_id: int):
+    proof = pipeline.get_dim_alignment_proof(job_id)
+    if not proof:
+        raise HTTPException(status_code=404, detail="该任务没有维对齐证明")
+    return proof
+
+
 @router.post("/jobs/paste-to-detail")
 def paste_to_detail(body: JobBody):
     try:
